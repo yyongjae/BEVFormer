@@ -33,6 +33,11 @@ class PerceptionTransformer(BaseModule):
             Default: 4.
         two_stage_num_proposals (int): Number of proposals when set
             `as_two_stage` as True. Default: 300.
+        ego_axes (str): Axis layout of the ego/LiDAR frame the BEV grid is
+            expressed in, which decides how the ego translation is split
+            between the two BEV axes. ``'y_forward_x_right'`` (default) is the
+            nuScenes ``LIDAR_TOP`` frame; ``'x_forward_y_left'`` is the NAVSIM /
+            nuPlan ego frame and the mmdet3d LiDAR canonical frame.
     """
 
     def __init__(self,
@@ -48,6 +53,7 @@ class PerceptionTransformer(BaseModule):
                  can_bus_norm=True,
                  use_cams_embeds=True,
                  rotate_center=[100, 100],
+                 ego_axes='y_forward_x_right',
                  **kwargs):
         super(PerceptionTransformer, self).__init__(**kwargs)
         self.encoder = build_transformer_layer_sequence(encoder)
@@ -66,6 +72,23 @@ class PerceptionTransformer(BaseModule):
         self.two_stage_num_proposals = two_stage_num_proposals
         self.init_layers()
         self.rotate_center = rotate_center
+
+        # Which physical axis of the ego frame the BEV grid's two axes carry.
+        # The BEV grid itself is always (bev_w <-> pc_range x, bev_h <-> pc_range y);
+        # what differs between datasets is where "forward" and "left" sit in that
+        # frame, and `get_bev_features` has to decompose the ego translation
+        # accordingly (see the comment at the shift computation).
+        #   'y_forward_x_right'  nuScenes LIDAR_TOP: lidar2ego is a ~-90 deg
+        #                        z-rotation, so +y is forward and +x is right.
+        #   'x_forward_y_left'   NAVSIM / nuPlan ego (lidar2ego is the identity),
+        #                        and the mmdet3d LiDAR canonical frame: +x is
+        #                        forward and +y is left.
+        if ego_axes not in ('y_forward_x_right', 'x_forward_y_left'):
+            raise ValueError(
+                "ego_axes must be 'y_forward_x_right' (nuScenes LIDAR_TOP) or "
+                "'x_forward_y_left' (NAVSIM / mmdet3d LiDAR), got "
+                "{!r}".format(ego_axes))
+        self.ego_axes = ego_axes
 
     def init_layers(self):
         """Initialize layers of the Detr3DTransformer."""
@@ -130,11 +153,23 @@ class PerceptionTransformer(BaseModule):
         grid_length_x = grid_length[1]
         translation_length = np.sqrt(delta_x ** 2 + delta_y ** 2)
         translation_angle = np.arctan2(delta_y, delta_x) / np.pi * 180
+        # `bev_angle` is the direction of travel measured in the ego frame, from
+        # the ego heading, positive clockwise -- so cos() is the component ALONG
+        # the heading (forward) and sin() the component to the ego's RIGHT.
+        # Which BEV axis each lands on depends on the ego frame's axis layout,
+        # and `shift` is consumed as (x, y) == (bev_w axis, bev_h axis).
         bev_angle = ego_angle - translation_angle
-        shift_y = translation_length * \
-            np.cos(bev_angle / 180 * np.pi) / grid_length_y / bev_h
-        shift_x = translation_length * \
-            np.sin(bev_angle / 180 * np.pi) / grid_length_x / bev_w
+        forward = translation_length * np.cos(bev_angle / 180 * np.pi)
+        rightward = translation_length * np.sin(bev_angle / 180 * np.pi)
+        if self.ego_axes == 'y_forward_x_right':
+            # nuScenes LIDAR_TOP: forward is +y (the bev_h axis), right is +x.
+            shift_x = rightward / grid_length_x / bev_w
+            shift_y = forward / grid_length_y / bev_h
+        else:
+            # NAVSIM / mmdet3d LiDAR: forward is +x (the bev_w axis), and the
+            # lateral axis points LEFT, so the rightward component is negated.
+            shift_x = forward / grid_length_x / bev_w
+            shift_y = -rightward / grid_length_y / bev_h
         shift_y = shift_y * self.use_shift
         shift_x = shift_x * self.use_shift
         shift = bev_queries.new_tensor(
